@@ -1,0 +1,21 @@
+A Python encoder for the Free Lossless Audio Codec
+
+Requires Python 3 and some packages. Get started in two steps:
+
+1. Install the requirements:
+
+    $ pip3 install -r requirements.txt
+
+2. Run it:
+
+    $ python3 encode.py input_file.wav output_file.flac
+
+--------------------------------------------------------------------------------
+
+I'm writing this encoder to help me understand FLAC in intricate detail. The
+implementation prioritizes simplicity over performance, so if you find this code
+easy to understand then I've done my job. If you want a fast and robust
+implementation, have a look at the reference encoder
+(http://flac.sourceforge.net).
+
+For simplicity, the encoder only supports 16-bit 44.1 kHz stereo wave input.
