@@ -333,81 +333,54 @@ class Frame:
                self.get_subframe_and_padding_bytes() + \
                self.get_footer_bytes()
 
+# TODO: This is an abstract class
 class Subframe:
-    def __init__(self, subframe_header, subframe_data):
-        self.subframe_header = subframe_header
-        self.subframe_data = subframe_data
+    def __init__(self):
+        self.header_bits = bitarray(8)
+        self.data_bits = bitarray()
+
+        self.header_bits[0] = 0     # Mandatory value
+        self.header_bits[1:7] = 0   # These bits must be filled in by a subclass
+        self.header_bits[7] = 0     # TODO: Wasted bits
 
     def __len__(self):
         return self.get_bits().length()
 
+# TODO: Memoize this value
     def get_bits(self):
-        return self.subframe_header.get_bits() + \
-               self.subframe_data.get_bits()
+        return self.header_bits + self.data_bits
 
-class SubframeHeader:
-    def __init__(self):
-        self.bits = bitarray(8)
-
-        self.bits[0] = 0    # Mandatory value
-        self.bits[1:7] = 0  # These bits must be filled in by a subclass
-        self.bits[7] = 0    # TODO: Wasted bits
-
-    def get_bits(self):
-        return self.bits
-
-class SubframeHeaderConstant(SubframeHeader):
-    def __init__(self):
-        super().__init__()
-
-        self.bits[1:7] = bitarray('000000')  # SUBFRAME_CONSTANT
-
-class SubframeHeaderVerbatim(SubframeHeader):
-    def __init__(self):
-        super().__init__()
-
-        self.bits[1:7] = bitarray('000001')  # SUBFRAME_VERBATIM
-
-class SubframeHeaderFixed(SubframeHeader):
-    def __init__(self, order):
-        super().__init__()
-
-        self.bits[1:4] = bitarray('001')                # SUBFRAME_FIXED
-        self.bits[4:7] = bitarray_from_int(order, 3)
-
-class SubframeConstant:
+class SubframeConstant(Subframe):
     def __init__(self, constant):
-        self.constant = constant
+        super().__init__()
 
-    def get_bits(self):
-        return bitarray_from_signed(self.constant, SAMPLE_SIZE)
+        self.header_bits[1:7] = bitarray('000000')  # SUBFRAME_CONSTANT
+        self.data_bits = bitarray_from_signed(constant, SAMPLE_SIZE)
 
-class SubframeVerbatim:
+class SubframeVerbatim(Subframe):
     def __init__(self, samples):
-        self.samples = samples
+        super().__init__()
 
-    def get_bits(self):
-        verbatim_sample_bytes = struct.pack('>' + str(len(self.samples)) + 'h', *self.samples)
+        self.header_bits[1:7] = bitarray('000001')  # SUBFRAME_VERBATIM
 
-        bits = bitarray()
-        bits.frombytes(verbatim_sample_bytes)
-
-        return bits
+        verbatim_sample_bytes = struct.pack('>' + str(len(samples)) + 'h', *samples)
+        self.data_bits.frombytes(verbatim_sample_bytes)
 
 # ------------------------------------------------------------------------------
 
-class SubframeFixed:
-    def __init__(self, warmup_samples, residual):
-        self.warmup_samples = warmup_samples
-        self.residual = residual
+class SubframeFixed(Subframe):
+    def __init__(self, predictor_order, warmup_samples, residual):
+        super().__init__()
 
-    def get_bits(self):
+        self.header_bits[1:4] = bitarray('001')             # SUBFRAME_FIXED
+        self.header_bits[4:7] = bitarray_from_int(predictor_order, 3)
+
         warmup_sample_bits = bitarray()
 
-        for sample in self.warmup_samples:
+        for sample in warmup_samples:
             warmup_sample_bits.extend(bitarray_from_signed(sample, SAMPLE_SIZE))
 
-        return warmup_sample_bits + self.residual.get_bits()
+        self.data_bits = warmup_sample_bits + residual.get_bits()
 
 class Residual:
     def __init__(self, coding_method, partitioned_rice):
@@ -572,11 +545,12 @@ def make_subframe_constant(channel, sample_index):
         if sample != first_sample:
             return None
 
-    subframe_constant = SubframeConstant(first_sample)
-    subframe_header = SubframeHeaderConstant()
-    subframe = Subframe(subframe_header, subframe_constant)
+    return SubframeConstant(first_sample)
 
-    return subframe
+def make_subframe_verbatim(channel, sample_index):
+    signal = channel[sample_index : sample_index + BLOCK_SIZE]
+
+    return SubframeVerbatim(signal)
 
 # ------------------------------------------------------------------------------
 
@@ -625,20 +599,7 @@ def make_subframe_fixed(channel, sample_index, predictor_order):
     partitioned_rice = PartitionedRice(partition_order, rice_partitions)
     residual = Residual(RESIDUAL_CODING_METHOD_PARTITIONED_RICE2, partitioned_rice)
 
-    subframe_fixed = SubframeFixed(warmup_samples, residual)
-    subframe_header = SubframeHeaderFixed(predictor_order)
-    subframe = Subframe(subframe_header, subframe_fixed)
-
-    return subframe
-
-# ------------------------------------------------------------------------------
-
-def make_subframe_verbatim(channel, sample_index):
-    subframe_verbatim = SubframeVerbatim(channel[sample_index : sample_index + BLOCK_SIZE])
-    subframe_header = SubframeHeaderVerbatim()
-    subframe = Subframe(subframe_header, subframe_verbatim)
-
-    return subframe
+    return SubframeFixed(predictor_order, warmup_samples, residual)
 
 # ------------------------------------------------------------------------------
 
