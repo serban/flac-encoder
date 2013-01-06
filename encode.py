@@ -275,32 +275,12 @@ class MetadataBlockStreamInfo:
         return bits.tobytes() + self.md5_digest
 
 class Frame:
-    def __init__(self, frame_header, frame_footer, subframes):
-        self.frame_header = frame_header
-        self.frame_footer = frame_footer
-        self.subframes = subframes
-
-    def get_bytes(self):
-        subframe_bits = sum([subframe.get_bits() for subframe in self.subframes], bitarray())
-
-        num_padding_bits = 0
-
-        if subframe_bits.length() % 8:
-            num_padding_bits = 8 - (subframe_bits.length() % 8)
-
-        padding_bits = bitarray(num_padding_bits)   # Allocate padding bits
-        padding_bits.setall(0)                      # Set them all to zero
-
-        return self.frame_header.get_bytes() + \
-               (subframe_bits + padding_bits).tobytes() + \
-               self.frame_footer.get_bytes()
-
-class FrameHeader:
-    def __init__(self, frame_number, num_samples):
+    def __init__(self, frame_number, num_samples, subframes):
         self.frame_number = frame_number
         self.num_samples = num_samples
+        self.subframes = subframes
 
-    def get_bytes(self):
+    def get_header_bytes(self):
         bits = bitarray(32)                         # Only the first 32 bits are fixed
 
         bits[0:14]  = bitarray('11111111111110')    # Sync code
@@ -329,19 +309,7 @@ class FrameHeader:
 
         return crc_input + crc_bytes
 
-class FrameFooter:
-    def __init__(self, frame_header, subframes):
-        # TODO: Should FrameFooter depend on frame_header and subframes? The
-        # only thing this object stores is the CRC-16 calculation of those
-        # objects, so if we were to follow the established pattern, then the
-        # CRC-16 calculation should happen outside of this class, and the result
-        # should be the only dependency.
-
-        self.frame_header = frame_header
-        self.subframes = subframes
-
-    def get_bytes(self):
-        # TODO: This is duplicated from Frame.get_bytes(). DRY it up.
+    def get_subframe_and_padding_bytes(self):
         subframe_bits = sum([subframe.get_bits() for subframe in self.subframes], bitarray())
 
         num_padding_bits = 0
@@ -352,12 +320,18 @@ class FrameFooter:
         padding_bits = bitarray(num_padding_bits)   # Allocate padding bits
         padding_bits.setall(0)                      # Set them all to zero
 
-        crc_input = self.frame_header.get_bytes() + \
-                    (subframe_bits + padding_bits).tobytes()
+        return (subframe_bits + padding_bits).tobytes()
 
+    def get_footer_bytes(self):
+        crc_input = self.get_header_bytes() + self.get_subframe_and_padding_bytes()
         crc_bytes = struct.pack('>H', crc16(crc_input))
 
         return crc_bytes
+
+    def get_bytes(self):
+        return self.get_header_bytes() + \
+               self.get_subframe_and_padding_bytes() + \
+               self.get_footer_bytes()
 
 class Subframe:
     def __init__(self, subframe_header, subframe_data):
@@ -692,9 +666,7 @@ def encode_wave_stream(wave_stream):
 
         num_samples_in_frame = (wave_stream.num_samples - sample_index) if (wave_stream.num_samples - sample_index) < BLOCK_SIZE else BLOCK_SIZE
 
-        frame_header = FrameHeader(frame_number, num_samples_in_frame)
-        frame_footer = FrameFooter(frame_header, subframes)
-        frame = Frame(frame_header, frame_footer, subframes)
+        frame = Frame(frame_number, num_samples_in_frame, subframes)
 
         frames.append(frame)
 
