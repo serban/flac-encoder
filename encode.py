@@ -26,6 +26,7 @@
 import argparse
 import array
 import hashlib
+import math
 import pdb
 import pprint
 import struct
@@ -112,6 +113,11 @@ crc8 = crcmod.predefined.mkPredefinedCrcFun('crc-8')
 crc16 = crcmod.predefined.mkPredefinedCrcFun('crc-16-buypass')
 
 def bitarray_from_int(i, width):
+    assert i < 2**width
+
+    if width == 0:
+        return bitarray()
+
     return bitarray(('{:0' + str(width) + 'b}').format(i))
 
 def utf8_encoded_bitarray_from_int(i):
@@ -182,6 +188,8 @@ SAMPLE_RATE     = 44100 # Hz
 SAMPLE_SIZE     = 16    # Num bits per sample
 NUM_CHANNELS    = 2
 
+FIXED_PREDICTOR_ORDER = 4   # TODO: For now, use only a single fourth-order fixed predictor
+
 # ------------------------------------------------------------------------------
 
 BLOCK_TYPE_STREAMINFO       = 0
@@ -191,6 +199,9 @@ BLOCK_TYPE_SEEKTABLE        = 3
 BLOCK_TYPE_VORBIS_COMMENT   = 4
 BLOCK_TYPE_CUESHEET         = 5
 BLOCK_TYPE_PICTURE          = 6
+
+RESIDUAL_CODING_METHOD_PARTITIONED_RICE     = 0
+RESIDUAL_CODING_METHOD_PARTITIONED_RICE2    = 1
 
 class Stream:
     def __init__(self, metadata_blocks, frames):
@@ -253,9 +264,18 @@ class Frame:
         self.subframes = subframes
 
     def get_bytes(self):
-        # TODO: In the future, we may need to include zero padding
+        subframe_bits = sum([subframe.get_bits() for subframe in self.subframes], bitarray())
+
+        num_padding_bits = 0
+
+        if subframe_bits.length() % 8:
+            num_padding_bits = 8 - (subframe_bits.length() % 8)
+
+        padding_bits = bitarray(num_padding_bits)   # Allocate padding bits
+        padding_bits.setall(0)                      # Set them all to zero
+
         return self.frame_header.get_bytes() + \
-               b''.join([subframe.get_bytes() for subframe in self.subframes]) + \
+               (subframe_bits + padding_bits).tobytes() + \
                self.frame_footer.get_bytes()
 
 class FrameHeader:
@@ -304,9 +324,19 @@ class FrameFooter:
         self.subframes = subframes
 
     def get_bytes(self):
-        # TODO: In the future, we may need to include zero padding
+        # TODO: This is duplicated from Frame.get_bytes(). DRY it up.
+        subframe_bits = sum([subframe.get_bits() for subframe in self.subframes], bitarray())
+
+        num_padding_bits = 0
+
+        if subframe_bits.length() % 8:
+            num_padding_bits = 8 - (subframe_bits.length() % 8)
+
+        padding_bits = bitarray(num_padding_bits)   # Allocate padding bits
+        padding_bits.setall(0)                      # Set them all to zero
+
         crc_input = self.frame_header.get_bytes() + \
-                    b''.join([subframe.get_bytes() for subframe in self.subframes])
+                    (subframe_bits + padding_bits).tobytes()
 
         crc_bytes = struct.pack('>H', crc16(crc_input))
 
@@ -317,26 +347,142 @@ class Subframe:
         self.subframe_header = subframe_header
         self.subframe_data = subframe_data
 
-    def get_bytes(self):
-        return self.subframe_header.get_bytes() + \
-               self.subframe_data.get_bytes()
+    def __len__(self):
+        return self.get_bits().length()
+
+    def get_bits(self):
+        return self.subframe_header.get_bits() + \
+               self.subframe_data.get_bits()
 
 class SubframeHeader:
-    def get_bytes(self):
-        bits = bitarray(8)
+    def __init__(self):
+        self.bits = bitarray(8)
 
-        bits[0] = 0                     # Mandatory value
-        bits[1:7] = bitarray('000001')  # SUBFRAME_VERBATIM
-        bits[7] = 0                     # TODO: Wasted bits
+        self.bits[0] = 0    # Mandatory value
+        self.bits[1:7] = 0  # These bits must be filled in by a subclass
+        self.bits[7] = 0    # TODO: Wasted bits
 
-        return bits.tobytes()
+    def get_bits(self):
+        return self.bits
+
+class SubframeHeaderVerbatim(SubframeHeader):
+    def __init__(self):
+        super().__init__()
+
+        self.bits[1:7] = bitarray('000001')  # SUBFRAME_VERBATIM
+
+class SubframeHeaderFixed(SubframeHeader):
+    def __init__(self, order):
+        super().__init__()
+
+        self.bits[1:4] = bitarray('001')                # SUBFRAME_FIXED
+        self.bits[4:7] = bitarray_from_int(order, 3)
 
 class SubframeVerbatim:
     def __init__(self, samples):
         self.samples = samples
 
-    def get_bytes(self):
-        return struct.pack('>' + str(len(self.samples)) + 'h', *self.samples)
+    def get_bits(self):
+        verbatim_sample_bytes = struct.pack('>' + str(len(self.samples)) + 'h', *self.samples)
+
+        bits = bitarray()
+        bits.frombytes(verbatim_sample_bytes)
+
+        return bits
+
+class SubframeFixed:
+    def __init__(self, warmup_samples, residual):
+        self.warmup_samples = warmup_samples
+        self.residual = residual
+
+        assert len(warmup_samples) == FIXED_PREDICTOR_ORDER
+
+    def get_bits(self):
+        # TODO: What if len(warmup_samples) is not a multiple of 2?
+        assert len(self.warmup_samples) % 2 == 0
+
+        warmup_sample_bytes = struct.pack('>' + str(len(self.warmup_samples)) + 'h', *self.warmup_samples)
+
+        warmup_sample_bits = bitarray()
+        warmup_sample_bits.frombytes(warmup_sample_bytes)
+
+        return warmup_sample_bits + self.residual.get_bits()
+
+class Residual:
+    def __init__(self, coding_method, partitioned_rice):
+        self.coding_method = coding_method
+        self.partitioned_rice = partitioned_rice
+
+    def get_bits(self):
+        coding_method_bits = bitarray('00') if self.coding_method == RESIDUAL_CODING_METHOD_PARTITIONED_RICE else bitarray('01')
+
+        return coding_method_bits + self.partitioned_rice.get_bits()
+
+# PartitionedRice and PartitionedRice2 are identical
+class PartitionedRice:
+    def __init__(self, partition_order, rice_partitions):
+        self.partition_order = partition_order
+        self.rice_partitions = rice_partitions
+
+    def get_bits(self):
+        partition_order_bits = bitarray_from_int(self.partition_order, 4)
+
+        return sum([partition.get_bits() for partition in self.rice_partitions], partition_order_bits)
+
+# RiceParition and Rice2Partition are similar
+class Rice2Partition:
+    def __init__(self, parameter, residual_signal):
+        self.parameter = parameter
+        self.residual_signal = residual_signal
+
+    def get_bits(self):
+        assert self.parameter < 31  # TODO: For now, we won't support the parameter escape code
+
+        parameter_bits = bitarray_from_int(self.parameter, 5)
+
+        encoded_samples = list()
+
+        for sample in self.residual_signal:
+            # Instead of transmitting a sign bit, we map the set of integers
+            # onto the set of unsigned integers.
+            #
+            #    0 --> 0
+            #   -1 --> 1
+            #    1 --> 2
+            #   -2 --> 3
+            #    2 --> 4
+            #      ...
+            #
+            # Each mapped sample is encoded into
+            # | high-order bits number of zeros | 1 | self.parameter low-order bits |
+            #
+            # See http://lists.xiph.org/pipermail/flac-dev/2005-April/001788.html
+
+            mapped_sample = -2 * sample - 1 if sample < 0 else 2 * sample
+
+            # Split the bits of the mapped sample into two halves: the
+            # high-order bits and the low-order-bits
+            mask = (1 << self.parameter) - 1
+            low_order_bits = mapped_sample & mask
+            high_order_bits = mapped_sample >> self.parameter
+
+            low_order_bitarray = bitarray_from_int(low_order_bits, self.parameter)
+            high_order_bitarray = bitarray(high_order_bits) # Allocate high_order_bits number of bits
+            high_order_bitarray.setall(0)                   # Set them all to zero
+
+            encoded_sample = high_order_bitarray + bitarray('1') + low_order_bitarray
+            encoded_samples.append(encoded_sample)
+
+#           dbg("rice parameter = " + str(self.parameter))
+#           dbg("sample = " + str(sample))
+#           dbg("mapped_sample = " + str(mapped_sample))
+#           dbg("mask = " + str(bitarray_from_int(mask, 32)))
+#           dbg("low_order_bitarray = " + str(low_order_bitarray))
+#           dbg("high_order_bits value = " + str(high_order_bits))
+#           dbg("encoded_sample = " + str(encoded_sample))
+#           sep()
+
+        return sum(encoded_samples, parameter_bits)
 
 class WaveStream:
     def __init__(self, sample_size, sample_rate, channels, md5_digest):
@@ -388,7 +534,6 @@ def read_wave(input_path):
     # assume a little-endian machine.
 
     # TODO: Use NumPy
-
     channels = [list() for i in range(num_channels)]
 
     timer.start()
@@ -413,6 +558,59 @@ def read_wave(input_path):
 
     return wave_stream
 
+# ------------------------------------------------------------------------------
+
+def fixed_predictor_residual_signal(signal):
+    assert len(signal) > FIXED_PREDICTOR_ORDER  # TODO: Deal with this gracefully
+
+    # TODO: Use NumPy
+    residual_signal = list()
+
+    for i, sample in enumerate(signal[FIXED_PREDICTOR_ORDER:], start=FIXED_PREDICTOR_ORDER):
+        predicted_sample = 4*signal[i-1] - 6*signal[i-2] + 4*signal[i-3] - signal[i-4]
+        residual_sample = sample - predicted_sample
+        residual_signal.append(residual_sample)
+
+    return residual_signal
+
+def rice_parameter(residual_signal):
+    # The rice parameter is computed by log2(ln(2) * E(|x|)).  We can
+    # approximate E(|x|) by finding the average error per residual sample.
+
+    e_x = math.ceil(sum(map(abs, residual_signal)) / len(residual_signal))
+    ln_2 = math.log(2)
+
+    return math.ceil(math.log2(ln_2 * e_x)) if e_x > 0.0 else 0
+
+def make_subframe_fixed(channel, sample_index):
+    warmup_samples = channel[sample_index : sample_index + FIXED_PREDICTOR_ORDER]
+
+    residual_signal = fixed_predictor_residual_signal(channel[sample_index : sample_index + BLOCK_SIZE])
+    parameter = rice_parameter(residual_signal)
+
+    partition_order = 0 # TODO: We don't yet support partitioning
+    rice_partitions = (Rice2Partition(parameter, residual_signal),)
+
+    partitioned_rice = PartitionedRice(partition_order, rice_partitions)
+    residual = Residual(RESIDUAL_CODING_METHOD_PARTITIONED_RICE2, partitioned_rice)
+
+    subframe_fixed = SubframeFixed(warmup_samples, residual)
+    subframe_header = SubframeHeaderFixed(FIXED_PREDICTOR_ORDER)
+    subframe = Subframe(subframe_header, subframe_fixed)
+
+    return subframe
+
+# ------------------------------------------------------------------------------
+
+def make_subframe_verbatim(channel, sample_index):
+    subframe_verbatim = SubframeVerbatim(channel[sample_index : sample_index + BLOCK_SIZE])
+    subframe_header = SubframeHeaderVerbatim()
+    subframe = Subframe(subframe_header, subframe_verbatim)
+
+    return subframe
+
+# ------------------------------------------------------------------------------
+
 def encode_wave_stream(wave_stream):
     frames = list()
 
@@ -422,11 +620,11 @@ def encode_wave_stream(wave_stream):
         subframes = list()
 
         for channel in wave_stream.channels:
-            subframe_verbatim = SubframeVerbatim(channel[sample_index : sample_index + BLOCK_SIZE])
-            subframe_header = SubframeHeader()
-            subframe = Subframe(subframe_header, subframe_verbatim)
+            verbatim_subframe = make_subframe_verbatim(channel, sample_index)
+            fixed_subframe = make_subframe_fixed(channel, sample_index)
 
-            subframes.append(subframe)
+            smallest_subframe = fixed_subframe if len(fixed_subframe) < len(verbatim_subframe) else verbatim_subframe
+            subframes.append(smallest_subframe)
 
         num_samples_in_frame = (wave_stream.num_samples - sample_index) if (wave_stream.num_samples - sample_index) < BLOCK_SIZE else BLOCK_SIZE
 
