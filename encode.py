@@ -37,6 +37,7 @@ import wave
 import crcmod
 
 from bitarray import bitarray
+from bitstring import BitArray
 
 # ------------------------------------------------------------------------------
 
@@ -112,6 +113,9 @@ class Timer(object):
 crc8 = crcmod.predefined.mkPredefinedCrcFun('crc-8')
 crc16 = crcmod.predefined.mkPredefinedCrcFun('crc-16-buypass')
 
+# TODO: This doesn't support signed integers
+# TODO: Clean up or consolidate bitarray_from_int and bitarray_from_signed
+# TODO: Maybe call this bitarray_from_unsigned
 def bitarray_from_int(i, width):
     assert i < 2**width
 
@@ -119,6 +123,19 @@ def bitarray_from_int(i, width):
         return bitarray()
 
     return bitarray(('{:0' + str(width) + 'b}').format(i))
+
+def bitarray_from_signed(i, width):
+    assert i < 2**(width-1)
+    assert i >= -2**(width-1)
+
+    if width == 0:
+        assert i == 0
+        return bitarray()
+
+    # TODO: Using BitArray is a quick hack. Do two's complement stuff with bitwise operators instead.
+    bits = BitArray(int=i, length=width)
+
+    return bitarray(str(bits.bin))
 
 def utf8_encoded_bitarray_from_int(i):
     # i < 2**7
@@ -188,7 +205,7 @@ SAMPLE_RATE     = 44100 # Hz
 SAMPLE_SIZE     = 16    # Num bits per sample
 NUM_CHANNELS    = 2
 
-FIXED_PREDICTOR_ORDER = 4   # TODO: For now, use only a single fourth-order fixed predictor
+MAX_FIXED_PREDICTOR_ORDER = 4
 
 # ------------------------------------------------------------------------------
 
@@ -389,7 +406,7 @@ class SubframeConstant:
         self.constant = constant
 
     def get_bits(self):
-        return bitarray_from_int(self.constant, SAMPLE_SIZE)
+        return bitarray_from_signed(self.constant, SAMPLE_SIZE)
 
 class SubframeVerbatim:
     def __init__(self, samples):
@@ -410,16 +427,11 @@ class SubframeFixed:
         self.warmup_samples = warmup_samples
         self.residual = residual
 
-        assert len(warmup_samples) == FIXED_PREDICTOR_ORDER
-
     def get_bits(self):
-        # TODO: What if len(warmup_samples) is not a multiple of 2?
-        assert len(self.warmup_samples) % 2 == 0
-
-        warmup_sample_bytes = struct.pack('>' + str(len(self.warmup_samples)) + 'h', *self.warmup_samples)
-
         warmup_sample_bits = bitarray()
-        warmup_sample_bits.frombytes(warmup_sample_bytes)
+
+        for sample in self.warmup_samples:
+            warmup_sample_bits.extend(bitarray_from_signed(sample, SAMPLE_SIZE))
 
         return warmup_sample_bits + self.residual.get_bits()
 
@@ -594,15 +606,24 @@ def make_subframe_constant(channel, sample_index):
 
 # ------------------------------------------------------------------------------
 
-def fixed_predictor_residual_signal(signal):
-    assert len(signal) > FIXED_PREDICTOR_ORDER  # TODO: Deal with this gracefully
+def fixed_predictor_residual_signal(signal, order):
+    assert len(signal) > order  # TODO: Deal with this gracefully
+
+    predictors = [
+        lambda signal, index: 0,
+        lambda signal, index:     signal[index-1],
+        lambda signal, index: 2 * signal[index-1] -     signal[index-2],
+        lambda signal, index: 3 * signal[index-1] - 3 * signal[index-2] +     signal[index-3],
+        lambda signal, index: 4 * signal[index-1] - 6 * signal[index-2] + 4 * signal[index-3] - signal[index-4],
+    ]
 
     # TODO: Use NumPy
     residual_signal = list()
 
-    for i, sample in enumerate(signal[FIXED_PREDICTOR_ORDER:], start=FIXED_PREDICTOR_ORDER):
-        predicted_sample = 4*signal[i-1] - 6*signal[i-2] + 4*signal[i-3] - signal[i-4]
+    for index, sample in enumerate(signal[order:], start=order):
+        predicted_sample = predictors[order](signal, index)
         residual_sample = sample - predicted_sample
+
         residual_signal.append(residual_sample)
 
     return residual_signal
@@ -616,10 +637,12 @@ def rice_parameter(residual_signal):
 
     return math.ceil(math.log2(ln_2 * e_x)) if e_x > 0.0 else 0
 
-def make_subframe_fixed(channel, sample_index):
-    warmup_samples = channel[sample_index : sample_index + FIXED_PREDICTOR_ORDER]
+def make_subframe_fixed(channel, sample_index, predictor_order):
+    warmup_samples = channel[sample_index : sample_index + predictor_order]
 
-    residual_signal = fixed_predictor_residual_signal(channel[sample_index : sample_index + BLOCK_SIZE])
+    assert len(warmup_samples) == predictor_order   # TODO: Deal with this gracefully
+
+    residual_signal = fixed_predictor_residual_signal(channel[sample_index : sample_index + BLOCK_SIZE], predictor_order)
     parameter = rice_parameter(residual_signal)
 
     partition_order = 0 # TODO: We don't yet support partitioning
@@ -629,7 +652,7 @@ def make_subframe_fixed(channel, sample_index):
     residual = Residual(RESIDUAL_CODING_METHOD_PARTITIONED_RICE2, partitioned_rice)
 
     subframe_fixed = SubframeFixed(warmup_samples, residual)
-    subframe_header = SubframeHeaderFixed(FIXED_PREDICTOR_ORDER)
+    subframe_header = SubframeHeaderFixed(predictor_order)
     subframe = Subframe(subframe_header, subframe_fixed)
 
     return subframe
@@ -654,13 +677,15 @@ def encode_wave_stream(wave_stream):
         subframes = list()
 
         for channel in wave_stream.channels:
-            constant_subframe = make_subframe_constant(channel, sample_index)
-            verbatim_subframe = make_subframe_verbatim(channel, sample_index)
-            fixed_subframe = make_subframe_fixed(channel, sample_index)
+            subframe_candidates = list()
 
-            subframe_candidates = [constant_subframe, verbatim_subframe, fixed_subframe]
+            subframe_candidates.append(make_subframe_constant(channel, sample_index))
+            subframe_candidates.append(make_subframe_verbatim(channel, sample_index))
+
+            for fixed_predictor_order in range(MAX_FIXED_PREDICTOR_ORDER + 1):
+                subframe_candidates.append(make_subframe_fixed(channel, sample_index, fixed_predictor_order))
+
             subframe_candidates = filter(None, subframe_candidates)
-
             smallest_subframe = min(subframe_candidates, key=len)
 
             subframes.append(smallest_subframe)
