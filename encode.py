@@ -607,8 +607,6 @@ def make_subframe_constant(channel, sample_index):
 # ------------------------------------------------------------------------------
 
 def fixed_predictor_residual_signal(signal, order):
-    assert len(signal) > order  # TODO: Deal with this gracefully
-
     predictors = [
         lambda signal, index: 0,
         lambda signal, index:     signal[index-1],
@@ -638,11 +636,13 @@ def rice_parameter(residual_signal):
     return math.ceil(math.log2(ln_2 * e_x)) if e_x > 0.0 else 0
 
 def make_subframe_fixed(channel, sample_index, predictor_order):
+    signal = channel[sample_index : sample_index + BLOCK_SIZE]
     warmup_samples = channel[sample_index : sample_index + predictor_order]
 
-    assert len(warmup_samples) == predictor_order   # TODO: Deal with this gracefully
+    if len(signal) <= predictor_order or len(warmup_samples) < predictor_order:
+        return None
 
-    residual_signal = fixed_predictor_residual_signal(channel[sample_index : sample_index + BLOCK_SIZE], predictor_order)
+    residual_signal = fixed_predictor_residual_signal(signal, predictor_order)
     parameter = rice_parameter(residual_signal)
 
     partition_order = 0 # TODO: We don't yet support partitioning
