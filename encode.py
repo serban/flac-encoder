@@ -365,6 +365,12 @@ class SubframeHeader:
     def get_bits(self):
         return self.bits
 
+class SubframeHeaderConstant(SubframeHeader):
+    def __init__(self):
+        super().__init__()
+
+        self.bits[1:7] = bitarray('000000')  # SUBFRAME_CONSTANT
+
 class SubframeHeaderVerbatim(SubframeHeader):
     def __init__(self):
         super().__init__()
@@ -378,6 +384,13 @@ class SubframeHeaderFixed(SubframeHeader):
         self.bits[1:4] = bitarray('001')                # SUBFRAME_FIXED
         self.bits[4:7] = bitarray_from_int(order, 3)
 
+class SubframeConstant:
+    def __init__(self, constant):
+        self.constant = constant
+
+    def get_bits(self):
+        return bitarray_from_int(self.constant, SAMPLE_SIZE)
+
 class SubframeVerbatim:
     def __init__(self, samples):
         self.samples = samples
@@ -389,6 +402,8 @@ class SubframeVerbatim:
         bits.frombytes(verbatim_sample_bytes)
 
         return bits
+
+# ------------------------------------------------------------------------------
 
 class SubframeFixed:
     def __init__(self, warmup_samples, residual):
@@ -484,6 +499,8 @@ class Rice2Partition:
 
         return sum(encoded_samples, parameter_bits)
 
+# ------------------------------------------------------------------------------
+
 class WaveStream:
     def __init__(self, sample_size, sample_rate, channels, md5_digest):
         self.sample_size = sample_size
@@ -560,6 +577,23 @@ def read_wave(input_path):
 
 # ------------------------------------------------------------------------------
 
+def make_subframe_constant(channel, sample_index):
+    signal = channel[sample_index : sample_index + BLOCK_SIZE]
+
+    first_sample = signal[0]
+
+    for sample in signal:
+        if sample != first_sample:
+            return None
+
+    subframe_constant = SubframeConstant(first_sample)
+    subframe_header = SubframeHeaderConstant()
+    subframe = Subframe(subframe_header, subframe_constant)
+
+    return subframe
+
+# ------------------------------------------------------------------------------
+
 def fixed_predictor_residual_signal(signal):
     assert len(signal) > FIXED_PREDICTOR_ORDER  # TODO: Deal with this gracefully
 
@@ -620,10 +654,15 @@ def encode_wave_stream(wave_stream):
         subframes = list()
 
         for channel in wave_stream.channels:
+            constant_subframe = make_subframe_constant(channel, sample_index)
             verbatim_subframe = make_subframe_verbatim(channel, sample_index)
             fixed_subframe = make_subframe_fixed(channel, sample_index)
 
-            smallest_subframe = fixed_subframe if len(fixed_subframe) < len(verbatim_subframe) else verbatim_subframe
+            subframe_candidates = [constant_subframe, verbatim_subframe, fixed_subframe]
+            subframe_candidates = filter(None, subframe_candidates)
+
+            smallest_subframe = min(subframe_candidates, key=len)
+
             subframes.append(smallest_subframe)
 
         num_samples_in_frame = (wave_stream.num_samples - sample_index) if (wave_stream.num_samples - sample_index) < BLOCK_SIZE else BLOCK_SIZE
