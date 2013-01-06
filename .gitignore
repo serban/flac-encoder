@@ -1,0 +1,42 @@
+# Mac OS X
+.DS_Store
+
+# Vim
+.*.sw[a-z]
+
+# Emacs
+\#*#
+*~
+
+# Xcode
+*.mode1v3
+*.mode2v3
+*.pbxuser
+xcuserdata
+
+# Xcode 4
+build/
+xcuserdata/
+*.xcworkspace/
+
+# Eclipse
+.project
+.classpath
+.settings
+
+# Other Hidden Files
+.*
+
+# Ctags and Cscope
+tags
+cscope.*
+
+# Compiler Output
+*.pyc
+
+# Audio Files
+*.flac
+*.wav
+
+# FLAC Analysis Files
+*.ana
