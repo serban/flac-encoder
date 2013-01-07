@@ -25,10 +25,12 @@
 
 import argparse
 import array
+import cProfile
 import hashlib
 import math
 import pdb
 import pprint
+import pstats
 import struct
 import subprocess
 import time
@@ -659,7 +661,18 @@ def main():
     stream = encode_wave_stream(wave_stream)
     write_stream(stream, args['output_path'])
 
+def profile_main():
+    cProfile.run('main()', 'profile')
+
+    profile = pstats.Stats('profile')
+    profile.strip_dirs()
+
+#   profile.sort_stats('cumulative').print_stats(20)
+    profile.sort_stats('time').print_stats(20)
+#   profile.sort_stats('time').print_callers(20)
+
 # ------------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    main()
+#   main()
+    profile_main()
